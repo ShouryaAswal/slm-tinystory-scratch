@@ -4,7 +4,6 @@ from torch.nn import functional as F
 import numpy as np
 import sys
 import os
-import wandb
 from tqdm import tqdm
 
 # Add src to path so we can import the architecture
@@ -29,9 +28,6 @@ def get_batch(data):
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 def train():
-    # 1. Initialize Weights & Biases for live visualization
-    wandb.init(project="slm-tinystories", name="optimized-multi-gpu-run")
-
     # Load data directly into RAM
     print("Loading binary data into RAM...")
     data_path = 'data/train.bin'
@@ -39,21 +35,21 @@ def train():
         raise FileNotFoundError(f"Cannot find {data_path}. Did you run data_prep.py?")
     data = np.fromfile(data_path, dtype=np.uint16)
 
-    # 2. Initialize base architecture
+    # 1. Initialize base architecture
     model = SLM()
     
-    # 3. Multi-GPU Support via DataParallel
+    # 2. Multi-GPU Support via DataParallel
     if torch.cuda.device_count() > 1:
         print(f"🔥 Optimization: Utilizing {torch.cuda.device_count()} GPUs via DataParallel!")
         model = nn.DataParallel(model)
         
     model = model.to(device)
     
-    # 4. PyTorch 2.0 Compilation (Speeds up execution by removing Python overhead)
+    # 3. PyTorch 2.0 Compilation (Speeds up execution by removing Python overhead)
     print("Compiling model into C++ kernels (this takes ~1 min)...")
     model = torch.compile(model)
     
-    # 5. Fused Optimizer & Mixed Precision Setup
+    # 4. Fused Optimizer & Mixed Precision Setup
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, fused=True)
     scaler = torch.cuda.amp.GradScaler()
     
@@ -66,7 +62,7 @@ def train():
         
         optimizer.zero_grad(set_to_none=True)
         
-        # 6. Automatic Mixed Precision (AMP) logic
+        # 5. Automatic Mixed Precision (AMP) logic
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits, loss = model(xb, yb)
             # DataParallel returns a loss vector (one per GPU); we must average it
@@ -77,13 +73,12 @@ def train():
         scaler.step(optimizer)
         scaler.update()
         
-        # Update progress bar and WandB dashboard
+        # Update progress bar
         if iter % 10 == 0:
             current_loss = loss.item()
             pbar.set_description(f"Loss: {current_loss:.4f}")
-            wandb.log({"step": iter, "train/loss": current_loss})
             
-        # 7. Save Intermediate Checkpoints
+        # 6. Save Intermediate Checkpoints
         if iter > 0 and iter % eval_interval == 0:
             checkpoint_path = f'checkpoint_step_{iter}.pt'
             
@@ -101,8 +96,6 @@ def train():
     if isinstance(raw_model, nn.DataParallel):
         raw_model = raw_model.module
     torch.save(raw_model.state_dict(), 'checkpoint_final.pt')
-    
-    wandb.finish()
 
 if __name__ == "__main__":
     train()
