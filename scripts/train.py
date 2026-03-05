@@ -4,54 +4,52 @@ from torch.nn import functional as F
 import numpy as np
 import sys
 import os
+import warnings
 from tqdm import tqdm
+
+# Suppress harmless PyTorch 2.0 compiler and DataParallel warnings for clean output
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # Add src to path so we can import the architecture
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from src.model import SLM
 
 # Hyperparameters
-batch_size = 128  # Maximized to feed Dual T4 GPUs
+batch_size = 64  # Reduced to prevent GPU 0 OOM during DataParallel gathering
 block_size = 256
 max_iters = 5000 
 learning_rate = 3e-4
-eval_interval = 500  # Saves an intermediate checkpoint every 500 steps
+eval_interval = 500
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def get_batch(data):
-    # Randomly sample starting indices for the batch
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    
-    # Asynchronous data transfer (non_blocking=True) keeps the GPU fed without waiting
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 def train():
-    # Load data directly into RAM
     print("Loading binary data into RAM...")
     data_path = 'data/train.bin'
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Cannot find {data_path}. Did you run data_prep.py?")
     data = np.fromfile(data_path, dtype=np.uint16)
 
-    # 1. Initialize base architecture
     model = SLM()
     
-    # 2. Multi-GPU Support via DataParallel
     if torch.cuda.device_count() > 1:
         print(f"🔥 Optimization: Utilizing {torch.cuda.device_count()} GPUs via DataParallel!")
         model = nn.DataParallel(model)
         
     model = model.to(device)
     
-    # 3. PyTorch 2.0 Compilation (Speeds up execution by removing Python overhead)
     print("Compiling model into C++ kernels (this takes ~1 min)...")
     model = torch.compile(model)
     
-    # 4. Fused Optimizer & Mixed Precision Setup
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, fused=True)
-    scaler = torch.cuda.amp.GradScaler()
+    
+    # Updated to the modern PyTorch AMP syntax
+    scaler = torch.amp.GradScaler('cuda')
     
     print(f"Training fully optimized on {device}...")
     
@@ -62,10 +60,8 @@ def train():
         
         optimizer.zero_grad(set_to_none=True)
         
-        # 5. Automatic Mixed Precision (AMP) logic
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits, loss = model(xb, yb)
-            # DataParallel returns a loss vector (one per GPU); we must average it
             if torch.cuda.device_count() > 1:
                 loss = loss.mean()
         
@@ -73,16 +69,13 @@ def train():
         scaler.step(optimizer)
         scaler.update()
         
-        # Update progress bar
         if iter % 10 == 0:
             current_loss = loss.item()
             pbar.set_description(f"Loss: {current_loss:.4f}")
             
-        # 6. Save Intermediate Checkpoints
         if iter > 0 and iter % eval_interval == 0:
             checkpoint_path = f'checkpoint_step_{iter}.pt'
             
-            # Correctly unwrap the model to save the raw weights (ignoring DataParallel/Compile wrappers)
             raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
             if isinstance(raw_model, nn.DataParallel):
                 raw_model = raw_model.module
@@ -91,7 +84,6 @@ def train():
             
     print("Training complete.")
     
-    # Save the absolute final state just in case
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     if isinstance(raw_model, nn.DataParallel):
         raw_model = raw_model.module
